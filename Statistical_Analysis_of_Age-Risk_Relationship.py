@@ -29,7 +29,7 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 # ============================================================================
 
 APP_NAME = "Urban Flood Comprehensive Analyzer"
-APP_VERSION = "3.1.0"
+APP_VERSION = "4.0.0"
 DEFAULT_INPUT = r"E:\Global_Flood\FIG\DATA\Urban_age_V17.parquet"
 DEFAULT_OUTPUT = r"E:\Global_Flood\FIG\DATA"
 
@@ -111,8 +111,9 @@ COUNTRY_MAP = {
     356: 'Serranilla Bank', 357: 'Scarborough Shoal'
 }
 
+# Grid cell size: 100m x 100m = 0.01 km2
 CELL_AREA_KM2 = 0.01
-ENV_COLUMNS = ['Hazard_Index_EAD', 'Slope', 'DEM', 'Distance_from_River']
+ENV_COLUMNS = ['Slope', 'DEM', 'Distance_from_River']
 
 
 # ============================================================================
@@ -172,6 +173,8 @@ class Icons:
     DATA = "📋"
     STATS = "📈"
     MAP = "🗺️"
+    FLOOD = "🌊"
+    SEARCH = "🔍"
 
 
 # ============================================================================
@@ -181,29 +184,33 @@ class Icons:
 class UnifiedDataAnalyzer:
     """Unified Data Analyzer - Integrates all statistical computations
 
-    v3.1 Changes:
-    - Added "All" category for each grouping type
-    - Statistics now include n (count) and SE (standard error = σ/√n)
+    v4.0 Changes:
+    - Removed Hazard Index (Risk Index) classification statistics
+    - Added Flood Inundation Area and Area Ratio statistics
+    - Flood field: 1 = flooded, 0 or empty = not flooded
+    - Area calculated from grid count: each grid = 100m x 100m = 0.01 km2
     """
 
-    def __init__(self, log_callback=None, progress_callback=None, detail_callback=None):
+    def __init__(self, flood_column=None, log_callback=None, progress_callback=None, detail_callback=None):
         self.log = log_callback or print
         self.progress = progress_callback or (lambda x, y: None)
         self.detail = detail_callback or print
         self.should_stop = False
+        self.flood_column = flood_column  # User-selected flood inundation column
 
-        # [A] Area Statistics
+        # [A] Area Statistics (total area by dev status x age)
         self.area_by_dev_age = {}
 
-        # [B] Risk Index Statistics - Added 'all' for each grouping
-        self.risk_stats = {
-            'by_dev': {},  # Will include 'All' + Developed/Developing
-            'by_income': {},  # Will include 'All' + income levels
-            'by_continent': {},  # Will include 'All' + continents
-            'by_country': {}  # Will include 'All' + countries
+        # [B] Flood Inundation Area Statistics
+        # For each grouping: total_count, flooded_count per (category, age)
+        self.flood_stats = {
+            'by_dev': {},
+            'by_income': {},
+            'by_continent': {},
+            'by_country': {}
         }
 
-        # [C] Environmental Factor Statistics - Added 'all' for each grouping
+        # [C] Environmental Factor Statistics
         self.env_stats = {
             'by_dev': {},
             'by_income': {},
@@ -237,8 +244,8 @@ class UnifiedDataAnalyzer:
     def reset(self):
         """Reset all statistics"""
         self.area_by_dev_age = {}
-        for key in self.risk_stats:
-            self.risk_stats[key] = {}
+        for key in self.flood_stats:
+            self.flood_stats[key] = {}
         for key in self.env_stats:
             self.env_stats[key] = {}
         for key in self.exposure_totals:
@@ -259,6 +266,10 @@ class UnifiedDataAnalyzer:
         return {'sum': 0.0, 'sq_sum': 0.0, 'count': 0,
                 'min': float('inf'), 'max': float('-inf')}
 
+    def _init_flood_stats(self):
+        """Initialize flood inundation counters"""
+        return {'total_count': 0, 'flooded_count': 0}
+
     def _init_pop_exp(self):
         return {'pop_sum': 0.0, 'exp_sum': 0.0}
 
@@ -273,8 +284,18 @@ class UnifiedDataAnalyzer:
             stats['min'] = min(stats['min'], np.min(valid_vals))
             stats['max'] = max(stats['max'], np.max(valid_vals))
 
+    def _update_flood_stats(self, stats: dict, data: pd.DataFrame):
+        """Update flood inundation counters from data subset"""
+        total = len(data)
+        stats['total_count'] += total
+        if self.flood_column and self.flood_column in data.columns:
+            # Flooded = value is 1; not flooded = 0, NaN, or empty
+            flood_vals = pd.to_numeric(data[self.flood_column], errors='coerce').fillna(0)
+            flooded = (flood_vals == 1).sum()
+            stats['flooded_count'] += int(flooded)
+
     def _finalize_stats(self, stats: dict) -> dict:
-        """Finalize statistics with n, σ, and σ/√n (standard error)"""
+        """Finalize statistics with n, sigma, and SE"""
         if stats['count'] == 0:
             return {'mean': np.nan, 'std': np.nan, 'min': np.nan,
                     'max': np.nan, 'count': 0, 'se': np.nan}
@@ -282,7 +303,6 @@ class UnifiedDataAnalyzer:
         mean = stats['sum'] / n
         variance = max(0, (stats['sq_sum'] / n) - (mean ** 2))
         std = np.sqrt(variance)
-        # Standard Error = σ / √n
         se = std / np.sqrt(n) if n > 0 else np.nan
         return {
             'mean': mean,
@@ -290,7 +310,7 @@ class UnifiedDataAnalyzer:
             'min': stats['min'] if stats['min'] != float('inf') else np.nan,
             'max': stats['max'] if stats['max'] != float('-inf') else np.nan,
             'count': n,
-            'se': se  # σ/√n - Standard Error
+            'se': se
         }
 
     def process_chunk(self, df: pd.DataFrame, exclude_zero: bool = True) -> int:
@@ -323,7 +343,7 @@ class UnifiedDataAnalyzer:
                 continue
 
             self._process_area_stats(age_data, age)
-            self._process_risk_stats(age_data, age, exclude_zero)
+            self._process_flood_stats(age_data, age)
             self._process_env_stats(age_data, age, exclude_zero)
             self._process_pop_exposure(age_data, age)
 
@@ -342,91 +362,50 @@ class UnifiedDataAnalyzer:
                     key = (dev_name, age)
                     self.area_by_dev_age[key] = self.area_by_dev_age.get(key, 0) + count
 
-    def _process_risk_stats(self, data: pd.DataFrame, age: int, exclude_zero: bool):
-        """Process Risk Index statistics with 'All' category for each grouping"""
-        if 'Risk_Index' not in data.columns:
+    def _process_flood_stats(self, data: pd.DataFrame, age: int):
+        """Process Flood Inundation Area statistics for all groupings"""
+        if not self.flood_column or self.flood_column not in data.columns:
             return
 
-        def get_values(subset):
-            vals = subset['Risk_Index'].values.astype(float)
-            if exclude_zero:
-                vals = np.where(vals == 0, np.nan, vals)
-            return vals
+        def process_group(data_subset, key, target_dict):
+            if key not in target_dict:
+                target_dict[key] = self._init_flood_stats()
+            self._update_flood_stats(target_dict[key], data_subset)
 
         # === Process by Development Status (includes "All") ===
         if 'Developed' in data.columns:
-            # First, add "All" category for this grouping
-            key_all = ('All', age)
-            if key_all not in self.risk_stats['by_dev']:
-                self.risk_stats['by_dev'][key_all] = self._init_stats()
-            self._update_stats(self.risk_stats['by_dev'][key_all], get_values(data))
-
-            # Then individual categories
+            process_group(data, ('All', age), self.flood_stats['by_dev'])
             for dev_code, dev_name in DEVELOPED_MAP.items():
                 subset = data[data['Developed'] == dev_code]
-                if len(subset) == 0:
-                    continue
-                key = (dev_name, age)
-                if key not in self.risk_stats['by_dev']:
-                    self.risk_stats['by_dev'][key] = self._init_stats()
-                self._update_stats(self.risk_stats['by_dev'][key], get_values(subset))
+                if len(subset) > 0:
+                    process_group(subset, (dev_name, age), self.flood_stats['by_dev'])
 
         # === Process by Income Level (includes "All") ===
         if 'Income_Classification' in data.columns:
-            # First, add "All" category
-            key_all = ('All', age)
-            if key_all not in self.risk_stats['by_income']:
-                self.risk_stats['by_income'][key_all] = self._init_stats()
-            self._update_stats(self.risk_stats['by_income'][key_all], get_values(data))
-
-            # Then individual categories
+            process_group(data, ('All', age), self.flood_stats['by_income'])
             for income_code, income_name in INCOME_MAP.items():
                 subset = data[data['Income_Classification'] == income_code]
-                if len(subset) == 0:
-                    continue
-                key = (income_name, age)
-                if key not in self.risk_stats['by_income']:
-                    self.risk_stats['by_income'][key] = self._init_stats()
-                self._update_stats(self.risk_stats['by_income'][key], get_values(subset))
+                if len(subset) > 0:
+                    process_group(subset, (income_name, age), self.flood_stats['by_income'])
 
         # === Process by Continent (includes "All") ===
         if 'Sovereig' in data.columns:
-            # First, add "All" category
-            key_all = ('All', age)
-            if key_all not in self.risk_stats['by_continent']:
-                self.risk_stats['by_continent'][key_all] = self._init_stats()
-            self._update_stats(self.risk_stats['by_continent'][key_all], get_values(data))
-
-            # Then individual categories
+            process_group(data, ('All', age), self.flood_stats['by_continent'])
             for cont_code, cont_name in CONTINENT_MAP.items():
                 subset = data[data['Sovereig'] == cont_code]
-                if len(subset) == 0:
-                    continue
-                key = (cont_name, age)
-                if key not in self.risk_stats['by_continent']:
-                    self.risk_stats['by_continent'][key] = self._init_stats()
-                self._update_stats(self.risk_stats['by_continent'][key], get_values(subset))
+                if len(subset) > 0:
+                    process_group(subset, (cont_name, age), self.flood_stats['by_continent'])
 
         # === Process by Country (includes "All") ===
         if 'Country' in data.columns:
-            # First, add "All" category
-            key_all = ('All', age)
-            if key_all not in self.risk_stats['by_country']:
-                self.risk_stats['by_country'][key_all] = self._init_stats()
-            self._update_stats(self.risk_stats['by_country'][key_all], get_values(data))
-
-            # Then individual countries
+            process_group(data, ('All', age), self.flood_stats['by_country'])
             for country_code in data['Country'].unique():
                 if pd.isna(country_code):
                     continue
                 country_name = COUNTRY_MAP.get(int(country_code), f'Country_{int(country_code)}')
                 subset = data[data['Country'] == country_code]
-                if len(subset) == 0:
-                    continue
-                key = (country_name, age)
-                if key not in self.risk_stats['by_country']:
-                    self.risk_stats['by_country'][key] = self._init_stats()
-                self._update_stats(self.risk_stats['by_country'][key], get_values(subset))
+                if len(subset) > 0:
+                    process_group(subset, (country_name, age), self.flood_stats['by_country'])
 
     def _process_env_stats(self, data: pd.DataFrame, age: int, exclude_zero: bool):
         """Process Environmental Factor statistics with 'All' category for each grouping"""
@@ -448,10 +427,7 @@ class UnifiedDataAnalyzer:
 
         # === Process by Development Status (includes "All") ===
         if 'Developed' in data.columns:
-            # First, add "All" category
             process_group(data, ('All', age), self.env_stats['by_dev'])
-
-            # Then individual categories
             for dev_code, dev_name in DEVELOPED_MAP.items():
                 subset = data[data['Developed'] == dev_code]
                 if len(subset) > 0:
@@ -459,10 +435,7 @@ class UnifiedDataAnalyzer:
 
         # === Process by Income Level (includes "All") ===
         if 'Income_Classification' in data.columns:
-            # First, add "All" category
             process_group(data, ('All', age), self.env_stats['by_income'])
-
-            # Then individual categories
             for income_code, income_name in INCOME_MAP.items():
                 subset = data[data['Income_Classification'] == income_code]
                 if len(subset) > 0:
@@ -470,10 +443,7 @@ class UnifiedDataAnalyzer:
 
         # === Process by Continent (includes "All") ===
         if 'Sovereig' in data.columns:
-            # First, add "All" category
             process_group(data, ('All', age), self.env_stats['by_continent'])
-
-            # Then individual categories
             for cont_code, cont_name in CONTINENT_MAP.items():
                 subset = data[data['Sovereig'] == cont_code]
                 if len(subset) > 0:
@@ -481,10 +451,7 @@ class UnifiedDataAnalyzer:
 
         # === Process by Country (includes "All") ===
         if 'Country' in data.columns:
-            # First, add "All" category
             process_group(data, ('All', age), self.env_stats['by_country'])
-
-            # Then individual countries
             for country_code in data['Country'].unique():
                 if pd.isna(country_code):
                     continue
@@ -509,7 +476,6 @@ class UnifiedDataAnalyzer:
         update_pop_exp(age, data, self.pop_exposure['global'])
 
         if 'Developed' in data.columns:
-            # Add "All" category
             update_pop_exp(('All', age), data, self.pop_exposure['by_dev'])
             for dev_code, dev_name in DEVELOPED_MAP.items():
                 subset = data[data['Developed'] == dev_code]
@@ -517,7 +483,6 @@ class UnifiedDataAnalyzer:
                     update_pop_exp((dev_name, age), subset, self.pop_exposure['by_dev'])
 
         if 'Income_Classification' in data.columns:
-            # Add "All" category
             update_pop_exp(('All', age), data, self.pop_exposure['by_income'])
             for income_code, income_name in INCOME_MAP.items():
                 subset = data[data['Income_Classification'] == income_code]
@@ -525,7 +490,6 @@ class UnifiedDataAnalyzer:
                     update_pop_exp((income_name, age), subset, self.pop_exposure['by_income'])
 
         if 'Sovereig' in data.columns:
-            # Add "All" category
             update_pop_exp(('All', age), data, self.pop_exposure['by_continent'])
             for cont_code, cont_name in CONTINENT_MAP.items():
                 subset = data[data['Sovereig'] == cont_code]
@@ -533,7 +497,6 @@ class UnifiedDataAnalyzer:
                     update_pop_exp((cont_name, age), subset, self.pop_exposure['by_continent'])
 
         if 'Country' in data.columns:
-            # Add "All" category
             update_pop_exp(('All', age), data, self.pop_exposure['by_country'])
             for country_code in data['Country'].unique():
                 if pd.isna(country_code):
@@ -570,11 +533,11 @@ class UnifiedDataAnalyzer:
                         self.exposure_totals['by_income_year'].get(key, 0) + total
 
     def calculate_final_results(self) -> dict:
-        """Calculate final results with n and σ/√n (SE)"""
+        """Calculate final results"""
         results = {
             'summary': {},
             'area': {},
-            'risk': {},
+            'flood': {},
             'environment': {},
             'exposure': {}
         }
@@ -585,7 +548,8 @@ class UnifiedDataAnalyzer:
             'countries_count': len(self.stats_counters['countries_found']),
             'continents_count': len(self.stats_counters['continents_found']),
             'income_levels_count': len(self.stats_counters['income_levels_found']),
-            'ages_count': len(self.stats_counters['ages_found'])
+            'ages_count': len(self.stats_counters['ages_found']),
+            'flood_column': self.flood_column or 'N/A'
         }
 
         # [A] Area Statistics
@@ -606,24 +570,29 @@ class UnifiedDataAnalyzer:
         results['area']['by_dev_age'] = sorted(area_list, key=lambda x: (
             0 if x['Category'] == 'All' else 1, x['Category'], x['Built_Up_Age']))
 
-        # [B] Risk Index - Now includes n (count) and SE (σ/√n)
-        for group_name, group_data in self.risk_stats.items():
-            risk_list = []
+        # [B] Flood Inundation Area Statistics
+        for group_name, group_data in self.flood_stats.items():
+            flood_list = []
             for key, stats in group_data.items():
                 cat_name, age = key
-                final = self._finalize_stats(stats)
-                risk_list.append({
-                    'Category': cat_name, 'Built_Up_Age': age,
-                    'Risk_Mean': final['mean'], 'Risk_Std': final['std'],
-                    'Risk_Min': final['min'], 'Risk_Max': final['max'],
-                    'Sample_Count': final['count'],  # n
-                    'Risk_SE': final['se']  # σ/√n (Standard Error)
+                total_count = stats['total_count']
+                flooded_count = stats['flooded_count']
+                total_area_km2 = total_count * CELL_AREA_KM2
+                flooded_area_km2 = flooded_count * CELL_AREA_KM2
+                flood_ratio = (flooded_count / total_count * 100) if total_count > 0 else 0.0
+                flood_list.append({
+                    'Category': cat_name,
+                    'Built_Up_Age': age,
+                    'Total_Grid_Count': total_count,
+                    'Flooded_Grid_Count': flooded_count,
+                    'Total_Area_km2': total_area_km2,
+                    'Flooded_Area_km2': flooded_area_km2,
+                    'Flood_Area_Ratio_Percent': flood_ratio
                 })
-            # Sort with "All" first
-            results['risk'][group_name] = sorted(risk_list, key=lambda x: (
+            results['flood'][group_name] = sorted(flood_list, key=lambda x: (
                 0 if x['Category'] == 'All' else 1, x['Category'], x['Built_Up_Age']))
 
-        # [C] Environmental Factors - Now includes n and SE for each factor
+        # [C] Environmental Factors
         for group_name, group_data in self.env_stats.items():
             env_list = []
             for key, col_stats in group_data.items():
@@ -634,15 +603,14 @@ class UnifiedDataAnalyzer:
                         final = self._finalize_stats(col_stats[col])
                         row[f'{col}_Mean'] = final['mean']
                         row[f'{col}_Std'] = final['std']
-                        row[f'{col}_n'] = final['count']  # n
-                        row[f'{col}_SE'] = final['se']  # σ/√n
+                        row[f'{col}_n'] = final['count']
+                        row[f'{col}_SE'] = final['se']
                     else:
                         row[f'{col}_Mean'] = np.nan
                         row[f'{col}_Std'] = np.nan
                         row[f'{col}_n'] = 0
                         row[f'{col}_SE'] = np.nan
                 env_list.append(row)
-            # Sort with "All" first
             results['environment'][group_name] = sorted(env_list, key=lambda x: (
                 0 if x['Category'] == 'All' else 1, x['Category'], x['Built_Up_Age']))
 
@@ -668,7 +636,6 @@ class UnifiedDataAnalyzer:
                     'Total_Population': d['pop_sum'], 'Total_Exposure': d['exp_sum'],
                     'Exposure_Ratio_Percent': ratio
                 })
-            # Sort with "All" first
             results['exposure'][f'{group_name}_ratio'] = sorted(
                 ratio_list, key=lambda x: (
                     0 if x['Category'] == 'All' else 1, x['Category'], x['Built_Up_Age']))
@@ -701,9 +668,9 @@ class UnifiedDataAnalyzer:
 class ExcelReportGenerator:
     """Excel Report Generator with professional formatting
 
-    v3.1 Changes:
-    - Added n (sample count) and SE (standard error) columns
-    - "All" category included in each sheet
+    v4.0 Changes:
+    - Removed Risk Index sheets
+    - Added Flood Inundation Area sheets (flooded area + area ratio)
     """
 
     def __init__(self, output_dir: str):
@@ -722,7 +689,7 @@ class ExcelReportGenerator:
             'success': '34a853',
             'warning': 'fbbc04',
             'link': '1a73e8',
-            'all_highlight': 'e8f0fe'  # Highlight for "All" rows
+            'all_highlight': 'e8f0fe'
         }
 
         self.fonts = {
@@ -734,7 +701,7 @@ class ExcelReportGenerator:
             'small': Font(size=9, color='5f6368'),
             'link': Font(size=10, color='1a73e8', underline='single'),
             'number': Font(size=10, name='Consolas'),
-            'all_bold': Font(bold=True, size=10, color='1557b0')  # For "All" category
+            'all_bold': Font(bold=True, size=10, color='1557b0')
         }
 
         self.fills = {
@@ -743,7 +710,7 @@ class ExcelReportGenerator:
             'highlight': PatternFill('solid', fgColor='e8f0fe'),
             'success': PatternFill('solid', fgColor='e6f4ea'),
             'warning': PatternFill('solid', fgColor='fef7e0'),
-            'all_row': PatternFill('solid', fgColor='e8f0fe')  # For "All" rows
+            'all_row': PatternFill('solid', fgColor='e8f0fe')
         }
 
         thin_border = Side(style='thin', color='dadce0')
@@ -759,7 +726,7 @@ class ExcelReportGenerator:
 
         self._create_overview_sheet(wb, results)
         self._create_area_sheet(wb, results['area'])
-        self._create_risk_sheets(wb, results['risk'])
+        self._create_flood_sheets(wb, results['flood'])
         self._create_env_sheets(wb, results['environment'])
         self._create_exposure_sheets(wb, results['exposure'])
 
@@ -790,7 +757,7 @@ class ExcelReportGenerator:
         ws[f'B{row}'] = f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         ws[f'B{row}'].font = self.fonts['small']
         row += 1
-        ws[f'B{row}'] = f"Version: 3.1.0"
+        ws[f'B{row}'] = f"Version: {APP_VERSION}"
         ws[f'B{row}'].font = self.fonts['small']
         row += 3
 
@@ -805,7 +772,8 @@ class ExcelReportGenerator:
             ("Countries/Regions", f"{summary.get('countries_count', 0)}"),
             ("Continents", f"{summary.get('continents_count', 0)}"),
             ("Income Levels", f"{summary.get('income_levels_count', 0)}"),
-            ("Built-up Age Categories", f"{summary.get('ages_count', 0)}")
+            ("Built-up Age Categories", f"{summary.get('ages_count', 0)}"),
+            ("Flood Inundation Column", f"{summary.get('flood_column', 'N/A')}")
         ]
 
         for label, value in summary_items:
@@ -835,36 +803,36 @@ class ExcelReportGenerator:
              "Built-up area by development status and Built-up Age (includes All)",
              len(results.get('area', {}).get('by_dev_age', []))),
 
-            ("B1. Risk by Development", "B1_Risk_DevStatus",
-             "Flood risk index by development status (All/Developed/Developing) with n, σ, SE",
-             len(results.get('risk', {}).get('by_dev', []))),
+            ("B1. Flood by Development", "B1_Flood_DevStatus",
+             "Flood inundation area & ratio by development status (includes All)",
+             len(results.get('flood', {}).get('by_dev', []))),
 
-            ("B2. Risk by Income", "B2_Risk_Income",
-             "Flood risk index by income classification (includes All) with n, σ, SE",
-             len(results.get('risk', {}).get('by_income', []))),
+            ("B2. Flood by Income", "B2_Flood_Income",
+             "Flood inundation area & ratio by income classification (includes All)",
+             len(results.get('flood', {}).get('by_income', []))),
 
-            ("B3. Risk by Continent", "B3_Risk_Continent",
-             "Flood risk index by continent (includes All) with n, σ, SE",
-             len(results.get('risk', {}).get('by_continent', []))),
+            ("B3. Flood by Continent", "B3_Flood_Continent",
+             "Flood inundation area & ratio by continent (includes All)",
+             len(results.get('flood', {}).get('by_continent', []))),
 
-            ("B4. Risk by Country", "B4_Risk_Country",
-             "Flood risk index by country/region (includes All) with n, σ, SE",
-             len(results.get('risk', {}).get('by_country', []))),
+            ("B4. Flood by Country", "B4_Flood_Country",
+             "Flood inundation area & ratio by country/region (includes All)",
+             len(results.get('flood', {}).get('by_country', []))),
 
             ("C1. Env by Development", "C1_Env_DevStatus",
-             "Environmental factors by development status (includes All) with n, σ, SE",
+             "Environmental factors by development status (includes All) with n, SE",
              len(results.get('environment', {}).get('by_dev', []))),
 
             ("C2. Env by Income", "C2_Env_Income",
-             "Environmental factors by income level (includes All) with n, σ, SE",
+             "Environmental factors by income level (includes All) with n, SE",
              len(results.get('environment', {}).get('by_income', []))),
 
             ("C3. Env by Continent", "C3_Env_Continent",
-             "Environmental factors by continent (includes All) with n, σ, SE",
+             "Environmental factors by continent (includes All) with n, SE",
              len(results.get('environment', {}).get('by_continent', []))),
 
             ("C4. Env by Country", "C4_Env_Country",
-             "Environmental factors by country/region (includes All) with n, σ, SE",
+             "Environmental factors by country/region (includes All) with n, SE",
              len(results.get('environment', {}).get('by_country', []))),
 
             ("D1. Global Exposure Ratio", "D1_Global_ExpRatio",
@@ -909,14 +877,15 @@ class ExcelReportGenerator:
         row += 1
 
         notes = [
+            "- Flood Inundation: field value 1 = flooded, 0 or empty = not flooded",
+            "- Flooded Area (km2) = Flooded Grid Count x 0.01 km2 (each grid: 100m x 100m)",
+            "- Flood Area Ratio (%) = Flooded Area / Total Area x 100%",
             "- Exposure Ratio = Sum(Exposed Population) / Sum(Total Population) x 100%",
             "- Built-up Age: Years since urban development (5, 10, 15, ... 50)",
-            "- Risk Index: Composite flood risk indicator (higher = more risk)",
-            "- Environmental Factors: Hazard Index, Slope, DEM, Distance from River",
-            "- Cell Area: 0.01 km2 per grid cell",
+            "- Environmental Factors: Slope, DEM, Distance from River",
+            "- Cell Area: 0.01 km2 per grid cell (100m x 100m)",
             "- n: Sample count (number of valid observations)",
-            "- σ (Std): Standard deviation",
-            "- SE (σ/√n): Standard Error = Standard Deviation / Square Root of n",
+            "- SE (sigma/sqrt(n)): Standard Error",
             "- 'All' category: Aggregated statistics for all data in each grouping"
         ]
 
@@ -939,23 +908,26 @@ class ExcelReportGenerator:
         self._write_data_table(ws, headers, data,
                                ['Category', 'Built_Up_Age', 'Grid_Count', 'Area_km2', 'Ratio_Percent'])
 
-    def _create_risk_sheets(self, wb: Workbook, risk_data: dict):
-        """Create Risk Index sheets with n and SE (σ/√n) columns"""
+    def _create_flood_sheets(self, wb: Workbook, flood_data: dict):
+        """Create Flood Inundation Area sheets"""
         sheet_mapping = {
-            'by_dev': 'B1_Risk_DevStatus',
-            'by_income': 'B2_Risk_Income',
-            'by_continent': 'B3_Risk_Continent',
-            'by_country': 'B4_Risk_Country'
+            'by_dev': 'B1_Flood_DevStatus',
+            'by_income': 'B2_Flood_Income',
+            'by_continent': 'B3_Flood_Continent',
+            'by_country': 'B4_Flood_Country'
         }
 
-        # Updated headers to include n and SE
-        headers = ['Category', 'Built-up Age', 'Mean (β)', 'Std (σ)',
-                   'Min', 'Max', 'n', 'SE (σ/√n)']
-        keys = ['Category', 'Built_Up_Age', 'Risk_Mean', 'Risk_Std',
-                'Risk_Min', 'Risk_Max', 'Sample_Count', 'Risk_SE']
+        headers = ['Category', 'Built-up Age',
+                   'Total Grid Count', 'Flooded Grid Count',
+                   'Total Area (km2)', 'Flooded Area (km2)',
+                   'Flood Area Ratio (%)']
+        keys = ['Category', 'Built_Up_Age',
+                'Total_Grid_Count', 'Flooded_Grid_Count',
+                'Total_Area_km2', 'Flooded_Area_km2',
+                'Flood_Area_Ratio_Percent']
 
         for data_key, sheet_name in sheet_mapping.items():
-            data = risk_data.get(data_key, [])
+            data = flood_data.get(data_key, [])
             ws = wb.create_sheet(sheet_name)
             if data:
                 self._write_data_table(ws, headers, data, keys)
@@ -971,15 +943,12 @@ class ExcelReportGenerator:
             'by_country': 'C4_Env_Country'
         }
 
-        # Updated headers to include n and SE for each environmental factor
         headers = ['Category', 'Built-up Age',
-                   'Hazard Mean', 'Hazard Std', 'Hazard n', 'Hazard SE',
                    'Slope Mean', 'Slope Std', 'Slope n', 'Slope SE',
                    'DEM Mean', 'DEM Std', 'DEM n', 'DEM SE',
                    'River Dist Mean', 'River Dist Std', 'River Dist n', 'River Dist SE']
 
         keys = ['Category', 'Built_Up_Age',
-                'Hazard_Index_EAD_Mean', 'Hazard_Index_EAD_Std', 'Hazard_Index_EAD_n', 'Hazard_Index_EAD_SE',
                 'Slope_Mean', 'Slope_Std', 'Slope_n', 'Slope_SE',
                 'DEM_Mean', 'DEM_Std', 'DEM_n', 'DEM_SE',
                 'Distance_from_River_Mean', 'Distance_from_River_Std', 'Distance_from_River_n',
@@ -1126,7 +1095,7 @@ class ExcelReportGenerator:
 
     def _auto_column_width(self, ws, num_cols: int):
         for col in range(1, num_cols + 1):
-            ws.column_dimensions[get_column_letter(col)].width = 16
+            ws.column_dimensions[get_column_letter(col)].width = 18
 
 
 # ============================================================================
@@ -1150,6 +1119,8 @@ class Application:
         self.input_file = tk.StringVar(value=DEFAULT_INPUT)
         self.output_dir = tk.StringVar(value=DEFAULT_OUTPUT)
         self.exclude_zero = tk.BooleanVar(value=True)
+        self.flood_field = tk.StringVar(value="")  # User-selected flood column
+        self.file_columns = []  # Columns read from file
 
         self.start_time = None
         self.timer_running = False
@@ -1188,9 +1159,10 @@ class Application:
         tk.Label(title_frame, text=f"{Icons.CHART} Analysis Configuration",
                  font=('Segoe UI', 18, 'bold'),
                  bg=Theme.BG_CARD, fg=Theme.PRIMARY).pack(anchor='w')
-        tk.Label(title_frame, text="Urban Flood Comprehensive Analysis v3.1",
+        tk.Label(title_frame, text=f"Urban Flood Comprehensive Analysis v{APP_VERSION}",
                  font=('Segoe UI', 10), bg=Theme.BG_CARD, fg=Theme.TEXT_MUTED).pack(anchor='w')
 
+        # === File Paths Section ===
         file_frame = tk.LabelFrame(inner, text=f"{Icons.FOLDER} File Paths",
                                    font=('Segoe UI', 11, 'bold'),
                                    bg=Theme.BG_CARD, fg=Theme.TEXT_PRIMARY, padx=15, pady=15)
@@ -1220,15 +1192,58 @@ class Application:
                   font=('Segoe UI', 9), bg=Theme.PRIMARY_LIGHT,
                   fg=Theme.PRIMARY, relief='flat', padx=15).pack(side=tk.LEFT, padx=(10, 0))
 
-        stats_frame = tk.LabelFrame(inner, text=f"{Icons.STATS} Statistics Contents (v3.1)",
+        # === Flood Field Selection Section ===
+        flood_frame = tk.LabelFrame(inner, text=f"{Icons.FLOOD} Flood Inundation Field",
+                                    font=('Segoe UI', 11, 'bold'),
+                                    bg=Theme.BG_CARD, fg=Theme.TEXT_PRIMARY, padx=15, pady=15)
+        flood_frame.pack(fill=tk.X, pady=(0, 20))
+
+        tk.Label(flood_frame,
+                 text="Click 'Analyze File' to read columns, then select the flood field.",
+                 font=('Segoe UI', 9), bg=Theme.BG_CARD, fg=Theme.TEXT_MUTED,
+                 wraplength=380).pack(anchor='w', pady=(0, 8))
+        tk.Label(flood_frame,
+                 text="Flood field: 1 = flooded, 0 or empty = not flooded",
+                 font=('Segoe UI', 9), bg=Theme.BG_CARD, fg=Theme.TEXT_MUTED,
+                 wraplength=380).pack(anchor='w', pady=(0, 8))
+
+        analyze_row = tk.Frame(flood_frame, bg=Theme.BG_CARD)
+        analyze_row.pack(fill=tk.X, pady=(0, 10))
+
+        self.analyze_btn = tk.Button(analyze_row, text=f"{Icons.SEARCH} Analyze File",
+                                     command=self._analyze_file_columns,
+                                     font=('Segoe UI', 10, 'bold'),
+                                     bg=Theme.INFO, fg='white',
+                                     relief='flat', padx=20, pady=6,
+                                     cursor='hand2')
+        self.analyze_btn.pack(side=tk.LEFT)
+
+        self.column_status_label = tk.Label(analyze_row, text="No file analyzed yet",
+                                            font=('Segoe UI', 9),
+                                            bg=Theme.BG_CARD, fg=Theme.TEXT_MUTED)
+        self.column_status_label.pack(side=tk.LEFT, padx=(15, 0))
+
+        select_row = tk.Frame(flood_frame, bg=Theme.BG_CARD)
+        select_row.pack(fill=tk.X, pady=(0, 5))
+
+        tk.Label(select_row, text="Flood Field:",
+                 font=('Segoe UI', 10), bg=Theme.BG_CARD).pack(side=tk.LEFT, padx=(0, 10))
+
+        self.flood_combo = ttk.Combobox(select_row, textvariable=self.flood_field,
+                                        state='readonly', width=35,
+                                        font=('Consolas', 9))
+        self.flood_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # === Statistics Contents Section ===
+        stats_frame = tk.LabelFrame(inner, text=f"{Icons.STATS} Statistics Contents (v{APP_VERSION})",
                                     font=('Segoe UI', 11, 'bold'),
                                     bg=Theme.BG_CARD, fg=Theme.TEXT_PRIMARY, padx=15, pady=15)
         stats_frame.pack(fill=tk.X, pady=(0, 20))
 
         stats_items = [
             (f"{Icons.BUILDING} Built-up Area Statistics", "By Dev Status x Built-up Age (includes All)"),
-            (f"{Icons.WARNING} Flood Risk Index Statistics", "By Dev/Income/Continent/Country (with n, σ, SE)"),
-            (f"{Icons.MAP} Environmental Factor Statistics", "Hazard/Slope/DEM/River Dist (with n, σ, SE)"),
+            (f"{Icons.FLOOD} Flood Inundation Area", "Flooded Area & Area Ratio by Groups (includes All)"),
+            (f"{Icons.MAP} Environmental Factor Statistics", "Slope/DEM/River Dist (with n, SE)"),
             (f"{Icons.PEOPLE} Population Exposure Statistics", "Total Exposure + Ratio by Groups (includes All)"),
         ]
 
@@ -1240,6 +1255,7 @@ class Application:
             tk.Label(item_frame, text=f"    {desc}", font=('Segoe UI', 9),
                      bg=Theme.BG_CARD, fg=Theme.TEXT_MUTED).pack(anchor='w')
 
+        # === Options Section ===
         option_frame = tk.LabelFrame(inner, text=f"{Icons.GEAR} Options",
                                      font=('Segoe UI', 11, 'bold'),
                                      bg=Theme.BG_CARD, fg=Theme.TEXT_PRIMARY, padx=15, pady=15)
@@ -1249,6 +1265,7 @@ class Application:
                        font=('Segoe UI', 10), bg=Theme.BG_CARD,
                        activebackground=Theme.BG_CARD).pack(anchor='w')
 
+        # === Action Buttons ===
         btn_frame = tk.Frame(inner, bg=Theme.BG_CARD)
         btn_frame.pack(fill=tk.X, pady=(10, 0))
 
@@ -1360,6 +1377,55 @@ class Application:
         if path:
             self.output_dir.set(path)
 
+    def _analyze_file_columns(self):
+        """Analyze the input file and populate the flood field dropdown"""
+        input_path = self.input_file.get()
+        if not input_path or not os.path.exists(input_path):
+            messagebox.showerror("Error", "Please select a valid input file first.")
+            return
+
+        try:
+            self.analyze_btn.configure(state=tk.DISABLED)
+            self.column_status_label.configure(text="Reading file...", fg=Theme.INFO)
+            self.root.update_idletasks()
+
+            parquet_file = pq.ParquetFile(input_path)
+            schema = parquet_file.schema_arrow
+            all_columns = [field.name for field in schema]
+            self.file_columns = all_columns
+
+            # Populate the combobox with all columns
+            self.flood_combo['values'] = all_columns
+
+            # Try to auto-detect a likely flood column
+            flood_candidates = [c for c in all_columns if any(
+                kw in c.lower() for kw in ['flood', 'inundat', 'water', 'submer']
+            )]
+            if flood_candidates:
+                self.flood_field.set(flood_candidates[0])
+
+            total_rows = parquet_file.metadata.num_rows
+            self.column_status_label.configure(
+                text=f"{Icons.SUCCESS} {len(all_columns)} columns, {total_rows:,} rows",
+                fg=Theme.SUCCESS
+            )
+
+            self._log(f"{Icons.SEARCH} File analyzed: {len(all_columns)} columns found", 'INFO')
+            self._log(f"  {Icons.BULLET} Columns: {', '.join(all_columns[:15])}"
+                      f"{'...' if len(all_columns) > 15 else ''}", 'DETAIL')
+
+            if flood_candidates:
+                self._log(f"  {Icons.CHECK} Auto-detected flood candidate: {flood_candidates[0]}", 'SUCCESS')
+            else:
+                self._log(f"  {Icons.WARNING} No auto-detected flood column. Please select manually.", 'WARNING')
+
+        except Exception as e:
+            self.column_status_label.configure(text=f"Error: {str(e)[:50]}", fg=Theme.ERROR)
+            self._log(f"{Icons.ERROR} File analysis error: {str(e)}", 'ERROR')
+            messagebox.showerror("Error", f"Failed to analyze file:\n{str(e)}")
+        finally:
+            self.analyze_btn.configure(state=tk.NORMAL)
+
     def _log(self, message: str, tag: str = 'INFO'):
         self.log_text.insert(tk.END, f"{message}\n", tag)
         self.log_text.see(tk.END)
@@ -1369,9 +1435,9 @@ class Application:
         self._log(message, 'SYSTEM')
 
     def _log_header(self, message: str):
-        self._log(f"\n{'═' * 60}", 'HEADER')
+        self._log(f"\n{'=' * 60}", 'HEADER')
         self._log(f" {message}", 'HEADER')
-        self._log(f"{'═' * 60}", 'HEADER')
+        self._log(f"{'=' * 60}", 'HEADER')
 
     def _update_progress(self, value: int, text: str = ""):
         self.progress['value'] = value
@@ -1410,11 +1476,18 @@ class Application:
         output_path = self.output_dir.get()
 
         if not input_path or not os.path.exists(input_path):
-            messagebox.showerror("Error", "Please select a valid input file")
+            messagebox.showerror("Error", "Please select a valid input file.")
             return
         if not output_path or not os.path.isdir(output_path):
-            messagebox.showerror("Error", "Please select a valid output directory")
+            messagebox.showerror("Error", "Please select a valid output directory.")
             return
+
+        flood_col = self.flood_field.get()
+        if not flood_col:
+            messagebox.showwarning("Warning",
+                                   "No flood inundation field selected.\n\n"
+                                   "Please click 'Analyze File' first, then select the flood field.\n\n"
+                                   "The analysis will continue without flood statistics.")
 
         self.is_running = True
         self.should_stop = False
@@ -1430,7 +1503,7 @@ class Application:
 
         self.processing_thread = threading.Thread(
             target=self._run_analysis,
-            args=(input_path, output_path)
+            args=(input_path, output_path, flood_col)
         )
         self.processing_thread.start()
 
@@ -1439,11 +1512,15 @@ class Application:
         self.status_label.configure(text=f"{Icons.WARNING} Stopping...", fg=Theme.WARNING)
         self._log(f"\n{Icons.WARNING} Stop requested, please wait...", 'WARNING')
 
-    def _run_analysis(self, input_path: str, output_path: str):
+    def _run_analysis(self, input_path: str, output_path: str, flood_col: str):
         try:
             self._log_header(f"{Icons.ROCKET} ANALYSIS STARTED")
             self._log(f"{Icons.FILE} Input: {input_path}", 'INFO')
             self._log(f"{Icons.FOLDER} Output: {output_path}", 'INFO')
+            if flood_col:
+                self._log(f"{Icons.FLOOD} Flood Field: {flood_col}", 'INFO')
+            else:
+                self._log(f"{Icons.WARNING} Flood Field: Not selected (skipping flood stats)", 'WARNING')
 
             self._log(f"\n{Icons.INFO} Opening Parquet file...", 'INFO')
             parquet_file = pq.ParquetFile(input_path)
@@ -1464,13 +1541,19 @@ class Application:
             self._log(f"\n{Icons.GEAR} Analyzing required columns...", 'INFO')
             cols_to_read = ['Built_Up_Age']
 
+            # Add flood column if selected
+            if flood_col and flood_col in all_columns:
+                cols_to_read.append(flood_col)
+                self._log(f"  {Icons.CHECK} {flood_col} (Flood Inundation Field)", 'DETAIL')
+            elif flood_col:
+                self._log(f"  {Icons.ERROR} {flood_col} not found in file!", 'ERROR')
+                flood_col = ""  # Reset
+
             optional_cols = {
                 'Developed': 'Development Status',
                 'Country': 'Country Code',
                 'Income_Classification': 'Income Classification',
                 'Sovereig': 'Continent Code',
-                'Risk_Index': 'Risk Index',
-                'Hazard_Index_EAD': 'Hazard Index',
                 'Slope': 'Slope',
                 'DEM': 'Elevation',
                 'Distance_from_River': 'River Distance',
@@ -1498,8 +1581,9 @@ class Application:
             cols_to_read = list(set(cols_to_read))
             self._log(f"\n{Icons.INFO} Total columns to read: {len(cols_to_read)}", 'INFO')
 
-            self._log(f"\n{Icons.CALC} Initializing analyzer (v3.1 with All category)...", 'INFO')
+            self._log(f"\n{Icons.CALC} Initializing analyzer (v{APP_VERSION})...", 'INFO')
             analyzer = UnifiedDataAnalyzer(
+                flood_column=flood_col if flood_col else None,
                 log_callback=lambda msg: self._log(msg, 'INFO'),
                 progress_callback=self._update_progress,
                 detail_callback=lambda msg: self._log(msg, 'DETAIL')
@@ -1561,8 +1645,8 @@ class Application:
             self._update_progress(80, "Computing final statistics...")
 
             self._log(f"{Icons.ARROW} Summarizing area statistics (with All)...", 'INFO')
-            self._log(f"{Icons.ARROW} Computing risk index statistics (with n, σ, SE)...", 'INFO')
-            self._log(f"{Icons.ARROW} Computing environmental factor statistics (with n, σ, SE)...", 'INFO')
+            self._log(f"{Icons.ARROW} Computing flood inundation area & ratio...", 'INFO')
+            self._log(f"{Icons.ARROW} Computing environmental factor statistics (with n, SE)...", 'INFO')
             self._log(f"{Icons.ARROW} Computing population exposure ratios (with All)...", 'INFO')
 
             results = analyzer.calculate_final_results()
@@ -1577,7 +1661,7 @@ class Application:
 
             self._log(f"{Icons.ARROW} Writing Overview sheet...", 'DETAIL')
             self._log(f"{Icons.ARROW} Writing Area Statistics sheet...", 'DETAIL')
-            self._log(f"{Icons.ARROW} Writing Risk Index sheets (4) with n and SE...", 'DETAIL')
+            self._log(f"{Icons.ARROW} Writing Flood Inundation Area sheets (4)...", 'DETAIL')
             self._log(f"{Icons.ARROW} Writing Environmental Factor sheets (4) with n and SE...", 'DETAIL')
             self._log(f"{Icons.ARROW} Writing Population Exposure sheets (6)...", 'DETAIL')
 
